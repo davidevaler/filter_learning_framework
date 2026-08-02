@@ -22,9 +22,9 @@ class YoloConfig(BaseModel):
     train: str = Field(default="images", description="Training data directory.")
     test: str = Field(default="images", description="Testing data directory.")
     val: str = Field(default="images", description="Validation data directory.")
-    nc: int = Field(default=1, description="Number of classes.")
+    nc: int = Field(default=4, description="Number of classes.")
     names: List[str] = Field(
-        default=["malaria"], # Se un domani cercherai automobili, scriverai ["automobile"]
+        default_factory=lambda: ["ring", "trophozoite", "schizont", "gametocyte"],
         description="Names of the classes.",
     )
 
@@ -78,6 +78,9 @@ class Yolo:
 
         config = YoloConfig(
             path=Path(dataset.temporary_directory.name),
+            # Ripristiniamo le 4 classi originali usate dai creatori del modello
+            names=["ring", "trophozoite", "schizont", "gametocyte"], 
+            nc=4
         )
         config_path = config.store_yaml()
 
