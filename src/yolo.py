@@ -1,3 +1,8 @@
+"""
+yolo.py
+Wrapper for YOLO model operations including loading, evaluation, and configuration.
+"""
+
 from pathlib import Path
 from typing import List, Literal, Self
 from typing_extensions import deprecated
@@ -8,8 +13,6 @@ from ultralytics.models import YOLO
 from .dataset import (
     Dataset,
     DatasetSplit,
-    Magnitude,
-    MalariaStage,
     StagingDataset,
 )
 
@@ -19,9 +22,9 @@ class YoloConfig(BaseModel):
     train: str = Field(default="images", description="Training data directory.")
     test: str = Field(default="images", description="Testing data directory.")
     val: str = Field(default="images", description="Validation data directory.")
-    nc: int = Field(default=len(MalariaStage), description="Number of classes.")
+    nc: int = Field(default=1, description="Number of classes.")
     names: List[str] = Field(
-        default=[stage.name for stage in MalariaStage],
+        default=["malaria"], # Se un domani cercherai automobili, scriverai ["automobile"]
         description="Names of the classes.",
     )
 
@@ -35,17 +38,12 @@ class YoloConfig(BaseModel):
 
         dump = self.model_dump()
         dump["path"] = dump["path"].as_posix()
-        return yaml.dump(dump)
+        return yaml.dump(dump, default_flow_style=False)
 
 
 class Yolo:
     """
     Wrapper for YOLO model operations including loading, evaluation, and configuration.
-
-    Attributes:
-        model_path (Path): Path to the YOLO model weights.
-        yolo_model (YOLO): The loaded YOLO model instance.
-        device (Literal["cpu", "mps", "cuda"]): Device to run the model on.
     """
 
     model_path: Path
@@ -54,30 +52,15 @@ class Yolo:
 
     @deprecated("Yolo class should be instantiated via 'load_model' method.")
     def __init__(self, *_, **__):
-        """
-        Deprecated. Use 'load_model' class method to instantiate.
-        """
         ...
 
     @classmethod
     def load_model(
         cls, model_path: Path, device: Literal["cpu", "mps", "cuda"] = "cpu"
     ) -> Self:
-        """
-        Loads a YOLO model from the specified path.
-
-        Args:
-            model_path (Path): Path to the YOLO model weights.
-            device (Literal["cpu", "mps", "cuda"]): Device to run the model on.
-
-        Returns:
-            Yolo: An instance of the Yolo class with the model loaded.
-
-        Raises:
-            Exception: If the model path does not exist.
-        """
+        
         if not model_path.exists():
-            raise Exception("Given YOLO path doesn't exist.")
+            raise Exception(f"Given YOLO path doesn't exist: {model_path}")
 
         instance = object.__new__(cls)
         instance.model_path = model_path
@@ -89,12 +72,7 @@ class Yolo:
     def evaluate(self, dataset: StagingDataset) -> float:
         """
         Evaluates the YOLO model on a temporary dataset.
-
-        Args:
-            dataset (TemporaryDataset): The dataset to evaluate on.
-
-        Returns:
-            float: The mAP@0.5 metric for the evaluation.
+        Returns the mAP@0.5 metric.
         """
         from ultralytics.utils.metrics import DetMetrics
 
@@ -124,8 +102,9 @@ if __name__ == "__main__":
     stored_dataset = Dataset.load_from_directory(Path("resources/dataset"))
     model = Yolo.load_model(Path("resources/model.pt"))
 
+    # Aggiornato per usare domain invece di Magnitude
     samples = stored_dataset.pick_random_samples(
-        magnitude=Magnitude.LCM, split=DatasetSplit.TEST
+        domain="target", split=DatasetSplit.TEST
     )
 
     best_parameters: List[filters.ParametrizedFilter] = [
