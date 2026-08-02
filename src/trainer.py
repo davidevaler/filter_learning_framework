@@ -24,7 +24,6 @@ from tqdm import tqdm
 from .dataset import (
     Dataset,
     DatasetSplit,
-    Magnitude,
     StoredSample,
     TransientSample,
 )
@@ -179,7 +178,7 @@ if __name__ == "__main__":
 
     dataset = Dataset.load_from_directory(Path("resources/dataset"))
     samples = dataset.pick_random_samples(
-        magnitude=Magnitude.LCM, split=DatasetSplit.VAL
+        domain="target", split=DatasetSplit.VAL
     )
     model = Yolo.load_model(Path("resources/model.pt"))
 

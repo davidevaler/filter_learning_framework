@@ -5,7 +5,7 @@ from typing_extensions import deprecated
 from pydantic import BaseModel, Field
 from ultralytics.models import YOLO
 
-from dataset import (
+from .dataset import (
     Dataset,
     DatasetSplit,
     Magnitude,
