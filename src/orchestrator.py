@@ -23,7 +23,7 @@ from typing import (
 import optuna
 from pydantic import BaseModel, Field, PlainSerializer
 
-from .dataset import Dataset, DatasetSplit, Magnitude, StoredDataset
+from .dataset import Dataset, DatasetSplit
 from .filters import (
     BilateralFilterAdapter,
     ClaheFilterAdapter,
@@ -338,7 +338,7 @@ class Orchestrator:
     @staticmethod
     def train(
         model: Yolo,
-        dataset: StoredDataset,
+        dataset: Dataset,
         config: OrchestratorConfig,
     ) -> OrchestratorLog:
         log = OrchestratorLog()

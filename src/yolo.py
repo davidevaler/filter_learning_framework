@@ -4,8 +4,8 @@ Wrapper for YOLO model operations including loading, evaluation, and configurati
 """
 
 from pathlib import Path
-from typing import List, Literal, Self
-from typing_extensions import deprecated
+from typing import List, Literal
+from typing_extensions import Self, deprecated
 
 from pydantic import BaseModel, Field
 from ultralytics.models import YOLO
@@ -13,7 +13,6 @@ from ultralytics.models import YOLO
 from .dataset import (
     Dataset,
     DatasetSplit,
-    StagingDataset,
 )
 
 
@@ -69,16 +68,25 @@ class Yolo:
 
         return instance
 
-    def evaluate(self, dataset: StagingDataset) -> float:
+    def evaluate(self, dataset: Dataset) -> float:
         """
         Evaluates the YOLO model on a temporary dataset.
         Returns the mAP@0.5 metric.
         """
         from ultralytics.utils.metrics import DetMetrics
 
+        if not dataset.samples:
+            raise ValueError("Cannot evaluate an empty dataset.")
+
+        # Create a temporary YOLO configuration file for evaluation
+        dataset_root = getattr(dataset, "base_path", None)
+        if dataset_root is None:
+            # if the path is, for example, /tmp/.../yolo_eval_dataset/images/xxx.png,
+            # the root of the YOLO dataset is /tmp/.../yolo_eval_dataset
+            dataset_root = dataset.samples[0].image_path.parent.parent
+
         config = YoloConfig(
-            path=Path(dataset.temporary_directory.name),
-            # Ripristiniamo le 4 classi originali usate dai creatori del modello
+            path=Path(dataset_root),
             names=["ring", "trophozoite", "schizont", "gametocyte"], 
             nc=4
         )
@@ -99,15 +107,16 @@ class Yolo:
 
 
 if __name__ == "__main__":
+    import tempfile
     import filters
-    import dataset
 
-    stored_dataset = Dataset.load_from_directory(Path("resources/dataset"))
+    dataset = Dataset.from_yolo_directory(Path("resources/dataset"))
     model = Yolo.load_model(Path("resources/model.pt"))
 
-    # Aggiornato per usare domain invece di Magnitude
-    samples = stored_dataset.pick_random_samples(
-        domain="target", split=DatasetSplit.TEST
+    samples = dataset.pick_random_samples(
+        sample_count=50,
+        domain="target", 
+        split=DatasetSplit.TEST
     )
 
     best_parameters: List[filters.ParametrizedFilter] = [
@@ -135,15 +144,13 @@ if __name__ == "__main__":
         ),
     ]
 
-    transformed_samples: List[dataset.TransientSample] = []
-    for sample in samples:
-        transformed_sample = sample.apply_transform(best_parameters)
-        transformed_samples.append(transformed_sample)
-
-    transient_dataset = Dataset.create_transient_dataset(
-        samples=transformed_samples,
-    )
-
-    transient_dataset = transient_dataset.to_staging_dataset()
-    result = model.evaluate(transient_dataset)
-    print(result)
+    mini_dataset = Dataset(samples=samples)
+    
+    with tempfile.TemporaryDirectory() as temp_dir:
+        eval_path = Path(temp_dir) / "eval_run"
+        staged_dataset = mini_dataset.apply_filters_and_export(
+            filters=best_parameters,
+            destination_path=eval_path
+        )
+        result = model.evaluate(staged_dataset)
+        print(f"Test evaluation mAP@50: {result}")

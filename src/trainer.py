@@ -13,19 +13,18 @@ Main Components:
 Each class and method is documented, and all Pydantic fields include descriptions for clarity.
 """
 
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Type
 
 import optuna
 from optuna import Trial
 from pydantic import BaseModel
-from tqdm import tqdm
 
 from .dataset import (
     Dataset,
     DatasetSplit,
-    StoredSample,
-    TransientSample,
+    Sample,
 )
 from .filters import (
     FilterAdapter,
@@ -44,20 +43,20 @@ class Trainer:
 
     model: Yolo
     filters_path: List[Type[FilterAdapter]]
-    samples: List[StoredSample]
+    samples: List[Sample]
 
     def __init__(
         self,
         model: Yolo,
         filters_path: List[Type[FilterAdapter]],
-        samples: List[StoredSample],
+        samples: List[Sample],
     ) -> None:
         """
         Initialize the Trainer.
 
         Args:
             filters_path: List of filter adapter classes in the order to be applied.
-            dataset: List of samples to process.
+            samples: List of samples to process.
         """
         # Ensure filters are ordered correctly while allowing skipped layers (NoOp)
         last_filter_type_value = 0
@@ -139,32 +138,38 @@ class Trainer:
         # Store filter parameters in trial user attributes for logging
         trial.set_user_attr("filter_parameters", filter_parameters_serializable)
 
-        # Apply the filter pipeline to each image in the dataset
-        transformed_samples: List[TransientSample] = []
-        for sample in tqdm(self.samples, desc="Applying filters", unit="img"):
-            image = sample.load_image()
-            for layer_index, filter_class in enumerate(self.filters_path):
-                parametrized_filter = filter_class.parametrized(
-                    filter_parameters[layer_index]
-                )
-                image = parametrized_filter.apply(image)
-            transformed_samples.append(
-                TransientSample(numpy_image=image, labels=sample.labels)
+        # -------------------------------------------------------------
+        # THE FIX: Streaming & Memory Safe evaluation
+        # -------------------------------------------------------------
+        
+        # Optuna suggests hyperparameters for each filter in the path
+        parametrized_filters = [
+            f_class.parametrized(f_params) 
+            for f_class, f_params in zip(self.filters_path, filter_parameters)
+        ]
+
+        # Create a mini-dataset with the same samples to avoid modifying the original dataset
+        mini_dataset = Dataset(samples=self.samples)
+
+        # Use a temporary directory to stage the filtered dataset for evaluation
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            staging_path = Path(temp_dir_name) / "yolo_eval_dataset"
+            
+            # Apply filters and export the mini-dataset to the staging path
+            staged_dataset = mini_dataset.apply_filters_and_export(
+                filters=parametrized_filters, 
+                destination_path=staging_path
             )
-
-        transient_dataset = Dataset.create_transient_dataset(transformed_samples)
-        staging_dataset = transient_dataset.to_staging_dataset()
-
-        return self.model.evaluate(staging_dataset)
+            
+            
+            return self.model.evaluate(staged_dataset)
 
 
 if __name__ == "__main__":
     from filters import (
         ClaheFilterAdapter,
-        FilterParametersHint,
         LaplacianSharpenFilterAdapter,
         MedianBlurFilterAdapter,
-        NoOpFilterAdapter,
         SaturationBoostFilterAdapter,
     )
 
@@ -176,9 +181,12 @@ if __name__ == "__main__":
         direction="maximize",
     )
 
-    dataset = Dataset.load_from_directory(Path("resources/dataset"))
+    # Load dataset and pick random samples for training
+    dataset = Dataset.from_yolo_directory(Path("resources/dataset"))
     samples = dataset.pick_random_samples(
-        domain="target", split=DatasetSplit.VAL
+        sample_count=100,
+        domain="target", 
+        split=DatasetSplit.VAL
     )
     model = Yolo.load_model(Path("resources/model.pt"))
 
@@ -194,7 +202,7 @@ if __name__ == "__main__":
         samples=samples,
     )
 
-    # Run the optimization for 100 trials
+    # Run the optimization for 30 trials
     study.optimize(trainer.objective, n_trials=30)
 
     # Print the best hyperparameters found
