@@ -122,13 +122,6 @@ class Dataset:
             ))
 
         return cls(samples=samples)
-
-    # KNIME integration: placeholder for future implementation
-    @classmethod
-    def from_dataframe(cls, df, image_col: str, labels_col: str) -> Self:
-        """To be implemented for KNIME integration."""
-        pass
-
     # --- CORE OPERATIONS ---
 
     def pick_random_samples(self, sample_count: int, domain: Optional[str] = None, split: Optional[DatasetSplit] = None) -> List[Sample]:

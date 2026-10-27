@@ -1,14 +1,18 @@
 """
 orchestrator.py
 
-This module provides a comprehensive framework for orchestrating the optimization of image
-preprocessing filter combinations using Optuna. The orchestrator implements a layer-by-layer
-optimization strategy where filters are selected and optimized sequentially, building upon the
-best combination found in previous layers.
+This module provides a framework for orchestrating the optimization of image preprocessing
+filter combinations using Optuna. The orchestrator implements a greedy layer-by-layer
+strategy: at each layer every candidate filter is optimized on top of the filters selected
+in the previous layers, whose parameters are kept FROZEN. The best candidate is then fixed
+and the search moves to the next layer.
+
+The number of trials of each study is derived automatically from the search space of the
+filter under optimization (see trainer.trial_budget), and a study is stopped early when it
+stops improving.
 """
 
 import json
-import math
 from pathlib import Path
 from typing import (
     Annotated,
@@ -23,7 +27,7 @@ from typing import (
 import optuna
 from pydantic import BaseModel, Field, PlainSerializer
 
-from .dataset import Dataset, DatasetSplit
+from .dataset import Dataset
 from .filters import (
     BilateralFilterAdapter,
     ClaheFilterAdapter,
@@ -35,53 +39,44 @@ from .filters import (
     ParametrizedFilter,
     SaturationBoostFilterAdapter,
     UnsharpMaskFilterAdapter,
-    FilterParametersHint,
 )
-from .trainer import Trainer
+from .trainer import (
+    Trainer,
+    describe_search_space,
+    deserialize_pipeline,
+    trial_budget,
+)
 from .yolo import Yolo
 
 
-def _calculate_optimal_trials(filter_combination: List[Type[FilterAdapter]]) -> int:
+class PatienceCallback:
     """
-    Calcola il numero dinamico di iterazioni di Optuna necessarie 
-    in base alla complessità dei filtri nella combinazione.
+    Stops an Optuna study when the best value has not improved by at least
+    `min_delta` for `patience` consecutive trials.
     """
-    total_space_size = 1
-    has_continuous_vars = False
 
-    for filter_class in filter_combination:
-        if filter_class.__name__ == "NoOpFilterAdapter":
-            continue
-            
-        params_class = getattr(filter_class, "parameters_class", None)
-        if not params_class:
-            continue
-            
-        filter_space_size = 1
+    def __init__(self, patience: int, min_delta: float = 0.0) -> None:
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best: Optional[float] = None
+        self.stale_trials = 0
 
-        for field_name, field_info in params_class.model_fields.items():
-            type_hints = params_class.__annotations__.get(field_name)
-            if not type_hints:
-                continue
+    def __call__(self, study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+        if trial.state != optuna.trial.TrialState.COMPLETE or trial.value is None:
+            return
 
-            for hint in getattr(type_hints, '__metadata__', []):
-                if type(hint).__name__ == "FilterParametersHint":
-                    if getattr(hint, 'step', None) is not None:
-                        possibilities = math.floor((hint.upper_bound - hint.lower_bound) / hint.step) + 1
-                        filter_space_size *= possibilities
-                    else:
-                        has_continuous_vars = True
-                        filter_space_size *= 10
+        if self.best is None or trial.value > self.best + self.min_delta:
+            self.best = trial.value
+            self.stale_trials = 0
+        else:
+            self.stale_trials += 1
 
-        total_space_size *= filter_space_size
-
-    if total_space_size == 1 and not has_continuous_vars:
-        return 1
-        
-    if has_continuous_vars:
-        return min(max(total_space_size, 15), 40)
-    else:
-        return min(total_space_size, 30)
+        if self.stale_trials >= self.patience:
+            print(
+                f"  Early stopping: no improvement > {self.min_delta} "
+                f"in the last {self.patience} trials."
+            )
+            study.stop()
 
 
 class TrialResult(BaseModel):
@@ -132,6 +127,17 @@ class FilterOptimizationStudy(BaseModel):
         int,
         Field(default=0, description="Number of completed trials for this combination"),
     ] = 0
+    trial_budget: Annotated[
+        Optional[int],
+        Field(default=None, description="Maximum number of trials computed for this study"),
+    ] = None
+    search_space_size: Annotated[
+        Optional[int],
+        Field(
+            default=None,
+            description="Number of configurations of the optimized filter (None if continuous)",
+        ),
+    ] = None
 
     def add_trial(self, trial_result: TrialResult) -> None:
         self.all_trials.append(trial_result)
@@ -189,10 +195,10 @@ class OrchestratorLog(BaseModel):
         filter_names = [f.name for f in filters_without_noop]
 
         for report in self.reports:
-            report_filters_without_noop = [
-                name for name in report.filters if name != "NoOpFilterAdapter"
+            report_filter_names = [
+                f.name for f in report.filters if f != NoOpFilterAdapter
             ]
-            if report_filters_without_noop == filter_names:
+            if report_filter_names == filter_names:
                 return report
         return None
 
@@ -240,9 +246,67 @@ class OrchestratorConfig(BaseModel):
         Field(
             default=100,
             ge=1,
-            description="Legacy parameter. Max trials per combination now determined dynamically.",
+            description=(
+                "Hard upper bound on the trials of a single study. The actual number "
+                "is computed automatically and never exceeds this value."
+            ),
         ),
     ] = 100
+    search_top_fraction: Annotated[
+        float,
+        Field(
+            default=0.10,
+            gt=0.0,
+            lt=1.0,
+            description=(
+                "Fraction of the search space considered 'good enough'. With 0.10 the "
+                "budget aims at finding a configuration in the best 10% of the space."
+            ),
+        ),
+    ] = 0.10
+    search_confidence: Annotated[
+        float,
+        Field(
+            default=0.95,
+            gt=0.0,
+            lt=1.0,
+            description="Probability of hitting the top fraction of the space.",
+        ),
+    ] = 0.95
+    trials_per_parameter: Annotated[
+        int,
+        Field(
+            default=10,
+            ge=1,
+            description="Minimum number of trials per searched hyperparameter.",
+        ),
+    ] = 10
+    early_stopping_patience: Annotated[
+        Optional[int],
+        Field(
+            default=15,
+            ge=1,
+            description=(
+                "Stop a study after this many consecutive trials without improvement. "
+                "None disables early stopping. Not applied to exhaustive grid searches."
+            ),
+        ),
+    ] = 15
+    early_stopping_min_delta: Annotated[
+        float,
+        Field(
+            default=0.005,
+            ge=0.0,
+            description=(
+                "Minimum mAP50 gain that counts as an improvement. Should be of the "
+                "order of the noise of the metric on the validation set."
+            ),
+        ),
+    ] = 0.005
+    sampler_seed: Annotated[
+        Optional[int],
+        Field(default=None, description="Seed of the Optuna samplers, for reproducibility."),
+    ] = None
     optuna_db_path: Annotated[
         Path,
         Field(..., description="Path to Optuna SQLite database for storing studies"),
@@ -251,13 +315,13 @@ class OrchestratorConfig(BaseModel):
         Path,
         Field(..., description="Path to save/load orchestrator checkpoints"),
     ]
-    skip_all_noop: Annotated[
-        bool,
+    baseline_map_50: Annotated[
+        Optional[float],
         Field(
-            default=True,
-            description="If True, skip combinations where all filters are NoOp",
+            default=None,
+            description="mAP50 of the model WITHOUT any filter. ",
         ),
-    ] = True
+    ] = None
     study_name_prefix: Annotated[
         str,
         Field(
@@ -292,7 +356,10 @@ class OrchestratorConfig(BaseModel):
     optuna_study_kwargs: Annotated[
         Dict[str, Any],
         Field(
-            description="Additional keyword arguments to pass to optuna.create_study.",
+            description=(
+                "Additional keyword arguments to pass to optuna.create_study. "
+                "If it contains 'sampler', the automatic sampler choice is skipped."
+            ),
         ),
     ] = {}
 
@@ -330,7 +397,9 @@ class OrchestratorConfig(BaseModel):
 
     def save(self, config_path: Path) -> None:
         config_path.parent.mkdir(parents=True, exist_ok=True)
-        serializable_data = self.model_dump(mode="json")
+        serializable_data = self.model_dump(
+            mode="json", exclude={"trial_callback", "layer_callback", "optuna_study_kwargs"}
+        )
         config_path.write_text(json.dumps(serializable_data, indent=2))
 
 
@@ -348,8 +417,9 @@ class Orchestrator:
         for layer_index in range(log.current_layer_index, len(config.filter_layers)):
             current_layer = config.filter_layers[layer_index]
 
-            base_combination = [f.adapter for f in log.best_filters_combination]
+            # Filters selected in the previous layers: their parameters stay frozen
             base_parametrized_filters = log.best_filters_combination.copy()
+            base_combination = [f.adapter for f in base_parametrized_filters]
 
             layer_best_combination: Optional[List[Type[FilterAdapter]]] = None
             layer_best_parametrized_filters: Optional[List[ParametrizedFilter]] = None
@@ -358,6 +428,10 @@ class Orchestrator:
             print(f"\n{'=' * 60}")
             print(f"Processing Layer {layer_index + 1}/{len(config.filter_layers)}")
             print(f"Available filters: {', '.join([f.name for f in current_layer])}")
+            if base_parametrized_filters:
+                print("Frozen filters from previous layers:")
+                for f in base_parametrized_filters:
+                    print(f"  - {f.adapter.name}: {f.parameters.model_dump()}")
             print(f"{'=' * 60}\n")
 
             for filter_class in current_layer:
@@ -365,22 +439,26 @@ class Orchestrator:
                     base_combination + [filter_class]
                 )
 
-                if filter_class == NoOpFilterAdapter and base_combination:
-                    print("Skipping redundant NoOp combination (using base result)")
-                    if log.best_map_50 is not None and (
-                        layer_best_map_50 is None or log.best_map_50 > layer_best_map_50
+                if filter_class == NoOpFilterAdapter:
+                    if base_combination:
+                        # Not the first layer: NoOp reuses the best score already found
+                        baseline_score = log.best_map_50
+                    else:
+                        # First layer: NoOp is equivalent to the pure baseline, without any filters.
+                        # It must be passed from the outside because there is no existing
+                        # log.best_map_50 to rely on.
+                        baseline_score = config.baseline_map_50
+
+                    print(f"Evaluating NoOp (reference score: {baseline_score})")
+
+                    if baseline_score is not None and (
+                        layer_best_map_50 is None or baseline_score > layer_best_map_50
                     ):
-                        layer_best_map_50 = log.best_map_50
+                        layer_best_map_50 = baseline_score
                         layer_best_combination = trial_filters_combination.copy()
                         layer_best_parametrized_filters = (
                             base_parametrized_filters.copy()
                         )
-                    continue
-
-                if config.skip_all_noop and all(
-                    f == NoOpFilterAdapter for f in trial_filters_combination
-                ):
-                    print("Skipping all-NoOp combination")
                     continue
 
                 study_name = " + ".join([f.name for f in trial_filters_combination])
@@ -391,14 +469,38 @@ class Orchestrator:
 
                 report = log.add_or_get_report(trial_filters_combination, study_name)
 
-                # Calcolo dinamico delle iterazioni ottimali
-                optimal_trials = _calculate_optimal_trials(trial_filters_combination)
-                remaining_trials = optimal_trials - report.completed_trials_count
+                # Automatic budget: depends only on the filter being optimized,
+                # because the filters from previous layers are frozen.
+                space = describe_search_space([filter_class])
+                budget = trial_budget(
+                    space,
+                    top_fraction=config.search_top_fraction,
+                    confidence=config.search_confidence,
+                    trials_per_parameter=config.trials_per_parameter,
+                    hard_cap=config.n_trials_per_combination,
+                )
+                # If the budget covers the entire space, perform an exhaustive search
+                use_grid = (
+                    bool(space.grid)
+                    and space.size is not None
+                    and space.size <= budget
+                )
+                report.trial_budget = budget
+                report.search_space_size = space.size
+
+                size_label = "continuous" if space.size is None else str(space.size)
+                print(
+                    f"Search space: {space.n_parameters} parameter(s), "
+                    f"{size_label} configuration(s) -> budget {budget} trial(s) "
+                    f"({'exhaustive grid' if use_grid else 'TPE'})"
+                )
+
+                remaining_trials = budget - report.completed_trials_count
 
                 if remaining_trials <= 0:
                     print(
                         f"Study already completed "
-                        f"({report.completed_trials_count}/{optimal_trials} trials)"
+                        f"({report.completed_trials_count}/{budget} trials)"
                     )
                     print(
                         f"Best mAP@50: {report.best_trial.map_50 if report.best_trial else 'N/A'}"
@@ -415,60 +517,55 @@ class Orchestrator:
                         )
                     continue
 
-                print(
-                    f"Resuming study: {report.completed_trials_count}/"
-                    f"{optimal_trials} trials completed"
-                )
-
-                study_kwargs = {
+                study_kwargs: Dict[str, Any] = {
                     "study_name": study_name,
                     "storage": f"sqlite:///{config.optuna_db_path.as_posix()}",
                     "load_if_exists": True,
                     "direction": "maximize",
                     **config.optuna_study_kwargs,
                 }
+                if "sampler" not in study_kwargs:
+                    if use_grid:
+                        study_kwargs["sampler"] = optuna.samplers.GridSampler(
+                            space.grid, seed=config.sampler_seed
+                        )
+                    else:
+                        study_kwargs["sampler"] = optuna.samplers.TPESampler(
+                            seed=config.sampler_seed
+                        )
                 study = optuna.create_study(**study_kwargs)
 
                 trainer = Trainer(
                     model=model,
                     samples=dataset.samples,
-                    filters_path=trial_filters_combination,
+                    filters_path=[filter_class],
+                    frozen_filters=base_parametrized_filters,
                 )
 
                 def create_trial_callback(
                     captured_report: FilterOptimizationStudy,
                     captured_filters: List[Type[FilterAdapter]],
+                    captured_budget: int,
                 ) -> Callable[[optuna.Study, optuna.trial.FrozenTrial], None]:
                     def trial_callback(
                         _study: optuna.Study, trial: optuna.trial.FrozenTrial
                     ) -> None:
                         if trial.state == optuna.trial.TrialState.COMPLETE:
-                            parametrized_filters_dict: Optional[Dict[str, Dict]] = (
-                                trial.user_attrs.get("filter_parameters")
+                            serialized_pipeline = trial.user_attrs.get(
+                                "filter_parameters"
                             )
 
                             if trial.value is None:
                                 raise ValueError("Trial is missing 'value'.")
-                            if parametrized_filters_dict is None:
+                            if serialized_pipeline is None:
                                 raise ValueError(
                                     "Trial is missing 'filter_parameters' in user attributes."
                                 )
 
-                            parametrized_filters = []
-                            for (
-                                filter_name,
-                                parameters,
-                            ) in parametrized_filters_dict.items():
-                                base_name = filter_name.rsplit("_", 1)[0]
-                                filter_adapter = FilterAdapter.from_name(base_name)
-                                parameters_cls = getattr(
-                                    filter_adapter, "parameters_class"
-                                )  # type: ignore
-                                parametrized_filter = ParametrizedFilter(
-                                    adapter=filter_adapter,
-                                    parameters=parameters_cls(**parameters),  # type: ignore
-                                )
-                                parametrized_filters.append(parametrized_filter)
+                            # Complete pipeline: frozen filters + optimized filter
+                            parametrized_filters = deserialize_pipeline(
+                                serialized_pipeline
+                            )
 
                             trial_result = TrialResult(
                                 trial_number=trial.number,
@@ -511,22 +608,34 @@ class Orchestrator:
                             )
                             print(
                                 f"  Progress: {captured_report.completed_trials_count}/"
-                                f"{optimal_trials} trials"
+                                f"{captured_budget} trials"
                             )
 
                     return trial_callback
 
-                trial_callback = create_trial_callback(
-                    report, trial_filters_combination
-                )
+                callbacks: List[
+                    Callable[[optuna.Study, optuna.trial.FrozenTrial], None]
+                ] = [create_trial_callback(report, trial_filters_combination, budget)]
+
+                # Early stopping does not make sense on an exhaustive grid
+                if config.early_stopping_patience is not None and not use_grid:
+                    callbacks.append(
+                        PatienceCallback(
+                            patience=config.early_stopping_patience,
+                            min_delta=config.early_stopping_min_delta,
+                        )
+                    )
 
                 study.optimize(
                     trainer.objective,
                     n_trials=remaining_trials,
-                    callbacks=[trial_callback],
+                    callbacks=callbacks,
                 )
 
                 print(f"\nStudy complete for {study_name}")
+                print(
+                    f"Trials used: {report.completed_trials_count}/{budget}"
+                )
                 if report.best_trial:
                     print(f"Best mAP@50: {report.best_trial.map_50:.4f}")
 
@@ -564,6 +673,8 @@ class Orchestrator:
         print(
             f"Final best combination: {[f.adapter.name for f in log.best_filters_combination]}"
         )
+        for f in log.best_filters_combination:
+            print(f"  - {f.adapter.name}: {f.parameters.model_dump()}")
         if log.best_map_50 is None:
             print("Final best mAP@50: N/A")
         else:
