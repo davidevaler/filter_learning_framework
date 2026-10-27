@@ -8,6 +8,12 @@ wheels/
 
 # Virtual environments
 .venv
+venv/
 
 resources/dataset/
 resources/*.pt
+
+# Training and search outputs
+runs/
+*.db
+*.pt

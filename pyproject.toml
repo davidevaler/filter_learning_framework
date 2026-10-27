@@ -1,19 +1,20 @@
 [project]
-name = "siv"
-version = "0.1.0"
-description = "Add your description here"
+name = "filter-learning-framework"
+version = "0.2.0"
+description = "Automatic search of an image filter pipeline to reduce the HCM-LCM domain shift in malaria detection with YOLO"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.9"
 dependencies = [
-    "jupyter>=1.1.1",
-    "kagglehub>=0.4.2",
-    "numpy>=2.4.1",
-    "opencv-python>=4.13.0.90",
-    "optuna>=4.7.0",
-    "optuna-dashboard>=0.20.0",
-    "pydantic>=2.12.5",
-    "torch>=2.10.0",
-    "torchmetrics[detection]>=1.8.2",
-    "tqdm>=4.67.1",
+    "numpy>=2.0.2",
+    "opencv-python>=4.10",
+    "optuna>=4.0",
+    "pydantic>=2.10",
+    "pyyaml>=6.0",
+    "torch>=2.5.1",
+    "tqdm>=4.66",
+    "typing-extensions>=4.12",
     "ultralytics>=8.4.9",
 ]
+
+[project.optional-dependencies]
+dashboard = ["optuna-dashboard>=0.17"]
